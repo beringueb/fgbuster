@@ -70,6 +70,7 @@ __all__ = [
     'W_dBdB',
     'Wd',
     'fisher_logL_dB_dB',
+    'kl_divergence'
 ]
 
 
@@ -1137,3 +1138,22 @@ def _get_from_caller(name):
     """
     caller = inspect.currentframe().f_back.f_back
     return caller.f_locals[name]
+
+def kl_divergence(cholesky_emp, cholesky_mod, weights):
+    """
+
+    :param cholesky_emp: ndaray
+         cholseky decomposition of the empircal cavmat (computed outside this
+         function)
+    :param cholesky_mod: ndarray
+        chelseky decomposition of the model covmat (computed outside this
+        function)
+    :param weights
+    :return: float : kl divergence
+    """
+    m = cholesky_emp.shape[1]
+    Z = np.linalg.solve(cholesky_mod, cholesky_emp)
+    # Z = np.linalg.solve(cholesky_emp, cholesky_mod)
+    log_det = np.sum(np.log(np.diagonal(Z, axis1=1, axis2=2)), axis=-1)
+    k = .5 * (np.einsum('lij,lij->l', Z, Z) - 2. * log_det - m)
+    return (k.dot(weights)).sum()

@@ -24,6 +24,7 @@ import healpy as hp
 from . import algebra as alg
 from .mixingmatrix import MixingMatrix
 from .observation_helpers import standardize_instrument
+import scipy.optimize as opt
 
 
 __all__ = [
@@ -33,6 +34,8 @@ __all__ = [
     'harmonic_ilc',
     'harmonic_ilc_alm',
     'multi_res_comp_sep',
+    'sps4sat',
+    '_ell_nu',  ## TODO Remove, for debugging only
 ]
 
 
@@ -505,6 +508,107 @@ def harmonic_ilc(components, instrument, data, lbins=None, weights=None, iter=3)
     return res
 
 
+def sps4sat(model, instrument, data, start, lbins=None, weights=None, iter=3):
+    """ Semi-parametric separation (SMICA) BB 2023
+
+    Parameters
+    ----------
+    components: fgspectra model
+        `Model` for the covariance matrix. Fgspectra model object prepared for array evaluation.
+    instrument:
+        Object that provides the following as a key or an attribute.
+
+        - **frequency**
+        - **fwhm** (arcmin) they are deconvolved before ILC
+
+        They can be anything that is convertible to a float numpy array.
+    data: ndarray or MaskedArray
+        Data vector to be separated. Shape ``(n_freq, ..., n_pix)``.
+        ``...`` can be 1, 3 or absent. If 3, the separation is done independently
+	fot T, E and B.
+        Values equal to hp.UNSEEN or, if MaskedArray, masked values are
+        neglected during the component separation process.
+    lbins: array
+        It stores the edges of the bins that will have the same ILC weights.
+        If a multipole is not in a bin but is the alms, an independent bin
+	will be assigned to it
+    weights: array
+        If provided data are multiplied by the weights map before computing alms
+
+    Returns
+    -------
+    result : dict
+	It includes
+
+        - **W**: *(ndarray)* - ILC weights for each component and possibly
+	  each index of the `...` dimension in the alms.
+        - **s**: *(ndarray)* - Component maps
+        - **cl_in**: *(ndarray)* - Spectra of the input alm
+        - **cl_out**: *(ndarray)* - Spectra of the output alm
+        - **fsky**: *(ndarray)* - The input fsky used to correct the cls
+
+    Note
+    ----
+
+    * During the component separation, a pixel is masked if at least one of its
+      frequencies is masked.
+    * Output spectra are divided by the fsky. fsky is computed with the MASTER
+      formula if `weights` is provided, otherwise it is the fraction of unmasked
+      pixels
+
+    """
+    # instrument = standardize_instrument(instrument)
+    nside = hp.get_nside(data[0])
+    lmax = 3 * nside - 1
+
+    if weights is not None:
+        assert not np.any(_intersect_mask(data) * weights.astype(bool)), \
+            "Weights are non-zero where the data is masked"
+        fsky = np.mean(weights**2)**2 / np.mean(weights**4)
+    else:
+        mask = _intersect_mask(data)
+        fsky = float(mask.sum()) / mask.size
+
+    logging.info('Computing alms')
+    try:
+        assert np.any(instrument.fwhm)
+    except (AttributeError, AssertionError):
+        beams = None
+    else:  # Deconvolve the beam
+        beams = instrument.fwhm
+
+    alms = _get_alms(data, beams, lmax, weights, iter=iter)
+    logging.info('Computing empirical covmat')
+    cov = _empirical_harmonic_covariance(alms)
+    BASE_DIR = "/Users/benjaminberingue/Documents/Research/BB/projects/1123_fgbuster_sps4sat/test_data/"
+    np.save(BASE_DIR+'cov', cov.swapaxes(-1, -3))
+    if lbins is not None:
+        shape = cov.shape
+        cov_binned = np.zeros(shape[:2]+(len(lbins)-1,))
+        ell = []
+        for i_bin, (lmin, lmax) in enumerate(zip(lbins[:-1], lbins[1:])):
+            # Average the covariances in the bin
+            lmax = min(lmax, cov.shape[-1])
+            dof = 2 * np.arange(lmin, lmax) + 1
+            # cov[..., lmin:lmax] = (
+            #     (dof / dof.sum() * cov[..., lmin:lmax]).sum(-1)
+            #     )[..., np.newaxis]
+            cov_binned[...,i_bin] = (
+                (dof / dof.sum() * cov[..., lmin:lmax]).sum(-1)
+                )
+            ell.append(int(0.5*(lmax+lmin)))
+        cov = cov_binned
+    else:
+        ell = np.linspace(0, lmax, lmax+1)
+        lbins = ell
+    cov = cov.swapaxes(-1, -3)
+    np.save(BASE_DIR + 'cov_binned', cov)
+    nu = np.ones(3)
+    _ell_nu(model, ell, nu)
+    res = optimize_sps4sat(model, cov, start, lbins)
+    return res
+
+
 def _get_alms(data, beams=None, lmax=None, weights=None, iter=3):
     alms = []
     for f, fdata in enumerate(data):
@@ -520,13 +624,104 @@ def _get_alms(data, beams=None, lmax=None, weights=None, iter=3):
         for fwhm, alm in zip(beams, alms):
             bl = hp.gauss_beam(np.radians(fwhm/60.0), lmax, pol=(alm.ndim==2))
             if alm.ndim == 1:
-                alm = [alm]
-                bl = [bl]
+                alm = np.array([alm])
+                bl = np.array([bl])
 
             for i_alm, i_bl in zip(alm, bl.T):
                 hp.almxfl(i_alm, 1.0/i_bl, inplace=True)
-
     return alms
+
+
+def optimize_sps4sat(model, cov, start, lbins, kwargs_opt={}):
+    """Function that optimizes the model to fit the covmat (through minimization of the KL divergence between the
+    two matrices."""
+    f_optim, jac = optimizable_function(cov, model, start, lbins)
+    theta_start = model.kwargs2array(start)
+    res = opt.minimize(f_optim, x0=theta_start, jac=jac, **kwargs_opt)
+    return res
+
+def _ell_nu(model, ell, nu):
+    """Replaces the ell and nu params in the fgspectra model by their default value
+    (however deep they are in the nested dictionary)"""
+    model._update_path_nones()
+    template_kwargs = model.defaults.copy()
+    for path in model._path_nones:
+        if path[-1] == 'ell':
+            inner_path = path
+            inner_kwargs = template_kwargs
+            while len(inner_path) > 1:
+                inner_kwargs = inner_kwargs[inner_path[0]]
+                inner_path = inner_path[1:]
+            inner_kwargs['ell'] = ell
+            model.set_defaults(**template_kwargs)
+        elif path[-1] == 'nu':
+            inner_path = path
+            inner_kwargs = template_kwargs
+            while len(inner_path) > 1:
+                inner_kwargs = inner_kwargs[inner_path[0]]
+                inner_path = inner_path[1:]
+            inner_kwargs['nu'] = nu
+            model.set_defaults(**template_kwargs)
+
+
+def optimizable_function(emp_cov, model, param_default, lbins):
+    bins_max = lbins[1:]
+    bins_min = lbins[:-1]
+    n_bins = len(lbins) - 1
+    weights = np.array(
+        [(bins_max[i] - bins_min[i]) * (bins_max[i] + bins_min[i]) for i in
+         range(n_bins)])
+    # weights = bins_max * (2 * bins_max + 1) - (2 * bins_min + 1) * (2 * bins_min - 1) / 2
+
+    cholesky_emp = np.linalg.cholesky(emp_cov)
+    model.prepare_for_arrays(param_default)
+    shape = cholesky_emp.shape
+    id_3d = np.broadcast_to(np.identity(shape[1]), shape)
+
+    n_calls = [0]
+    x_old = [None]
+    cov_old = [None]
+    diff_old = [None]
+    cholesky_mod_old = [None]
+
+    ell = (lbins[1:] + lbins[:-1]) / 2
+    to_dl = ell * (ell + 1) / 2 / np.pi
+
+    def _update_old(x):
+        """
+        Check whether kl divergence and jac have already been computed for x.
+        If not computes and caches them.
+        :param x: ndarray
+        :return:
+        """
+        # if x is different from the last one, we compute the model.
+        if not np.all(x == x_old[0]):
+            kwargs = model.array2kwargs(x)
+            cov_old[0] = model.eval(**kwargs)
+            diff_old[0] = model.diff_kwargs2array(model.diff(**kwargs))
+            try:
+                cholesky_mod_old[0] = np.linalg.cholesky(cov_old[0].T)
+            except np.linalg.LinAlgError:
+                # print('Singular matrix')
+                pass
+            x_old[0] = x
+
+    def f_optim(x):
+        _update_old(x)
+        n_calls[0] = n_calls[0] + 1
+        kl = alg.kl_divergence(cholesky_emp, cholesky_mod_old[0], weights)
+        return kl
+
+    def diff_kl(x):
+        _update_old(x)
+        chol_inv = np.linalg.solve(cholesky_mod_old[0], id_3d)
+        inv_model = np.einsum('lji,ljk->ikl', chol_inv, chol_inv)
+        G = np.einsum('l,abl,bcl,cdl->adl', 0.5 * weights, inv_model,
+                      cov_old[0] - emp_cov, inv_model)
+        deriv = np.einsum('abl,pbal->p', G, diff_old[0])
+        return deriv
+
+    return f_optim, diff_kl
 
 
 def _apply_harmonic_W(W,  # (..., ell, comp, freq)
@@ -624,15 +819,12 @@ def _empirical_harmonic_covariance(alms):
 
     res = (alms[..., np.newaxis, :, :lmax+1, 0]
            * alms[..., :, np.newaxis, :lmax+1, 0])  # (Stokes, freq, freq, ell)
-
-
     consumed = lmax + 1
     for i in range(1, lmax+1):
         n_m = lmax + 1 - i
         alms_m = alms[..., consumed:consumed+n_m, :]
         res[..., i:] += 2 * np.einsum('...fli,...nli->...fnl', alms_m, alms_m)
         consumed += n_m
-
     res /= 2 * np.arange(lmax + 1) + 1
     return res
 
